@@ -44,7 +44,7 @@ impl Todo {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct CreateTodo {
-    text: String,
+    pub(crate) text: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
