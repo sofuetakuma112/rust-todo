@@ -15,6 +15,9 @@ use crate::repositories::{TodoRepository, TodoRepositoryForDb};
 use dotenv::dotenv;
 use sqlx::PgPool;
 
+use hyper::header::CONTENT_TYPE;
+use tower_http::cors::{Any, CorsLayer, Origin};
+
 #[tokio::main]
 async fn main() {
     let log_level = env::var("RUST_LOG").unwrap_or("info".to_string());
@@ -50,6 +53,12 @@ fn create_app<T: TodoRepository>(repository: T) -> Router {
                 .patch(update_todo::<T>),
         )
         .layer(Extension(Arc::new(repository))) // axumアプリケーションでrepositoryを共有して各ハンドラで受け取れるようにする
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Origin::exact("http://localhost:3001".parse().unwrap()))
+                .allow_methods(Any)
+                .allow_headers(vec![CONTENT_TYPE]),
+        )
 }
 
 async fn root() -> &'static str {

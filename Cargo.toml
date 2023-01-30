@@ -29,3 +29,4 @@ sqlx = { version = "0.5.11", features = [
     "postgres",
 ] }
 dotenv = "0.15.0"
+tower-http = { version = "0.2.5", features = ["cors"] }
