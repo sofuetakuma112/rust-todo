@@ -12,6 +12,6 @@ dev:
 test:
 	cargo test
 
-# standalone test
+# standalone test(DB接続が発生しないテストのみ実行)
 test-s:
 	cargo test --no-default-features
