@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
-use thiserror::Error;
 use validator::Validate;
 
+use super::label::Label;
 use super::RepositoryError;
 use axum::async_trait;
 
@@ -11,22 +11,78 @@ use axum::async_trait;
 #[async_trait]
 pub trait TodoRepository: Clone + std::marker::Send + std::marker::Sync + 'static {
     // sqlxによるSQL発行時にエラーとなる可能性があるので常にanyhow::Resultを返すよう実装させる
-    async fn create(&self, payload: CreateTodo) -> anyhow::Result<Todo>;
-    async fn find(&self, id: i32) -> anyhow::Result<Todo>;
-    async fn all(&self) -> anyhow::Result<Vec<Todo>>;
-    async fn update(&self, id: i32, payload: UpdateTodo) -> anyhow::Result<Todo>;
+    async fn create(&self, payload: CreateTodo) -> anyhow::Result<TodoEntity>;
+    async fn find(&self, id: i32) -> anyhow::Result<TodoEntity>;
+    async fn all(&self) -> anyhow::Result<Vec<TodoEntity>>;
+    async fn update(&self, id: i32, payload: UpdateTodo) -> anyhow::Result<TodoEntity>;
     async fn delete(&self, id: i32) -> anyhow::Result<()>;
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, FromRow)]
-pub struct Todo {
+// DBからの戻り値の型(リポジトリ層のメソッド内でのみ使用するのでシリアライズ系のトレイトは不要)
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct TodoWithLabelFromRow {
     id: i32,
     text: String,
     completed: bool,
+    label_id: Option<i32>,
+    label_name: Option<String>,
+}
+
+// XXXForDb, XXXForMemoryのメソッドはこのエンティティデータ型をハンドラ層に向けて返す
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct TodoEntity {
+    pub id: i32,
+    pub text: String,
+    pub completed: bool,
+    pub labels: Vec<Label>,
+}
+
+// ラベルの数だけ同じidのTodoが含まれていることを想定している
+fn fold_entities(rows: Vec<TodoWithLabelFromRow>) -> Vec<TodoEntity> {
+    let mut rows = rows.iter();
+    let mut accum: Vec<TodoEntity> = vec![];
+    'outer: while let Some(row) = rows.next() {
+        // iter_mut: 各値を変更することができるイテレータを返す。
+        let mut todos = accum.iter_mut();
+        while let Some(todo) = todos.next() {
+            if todo.id == row.id {
+                // 同じTodoに複数のラベルが付与されている
+                todo.labels.push(Label {
+                    id: row.label_id.unwrap(),
+                    name: row.label_name.clone().unwrap(),
+                });
+                continue 'outer; // 1. 既存のtodo.labelsにpushして次のループ
+            }
+        }
+
+        // 2. 新規でTodoEntityを作成してaccumにpushして次のループ
+        let labels = if row.label_id.is_some() {
+            vec![Label {
+                id: row.label_id.unwrap(),
+                name: row.label_name.clone().unwrap(),
+            }]
+        } else {
+            vec![]
+        };
+
+        accum.push(TodoEntity {
+            id: row.id,
+            text: row.text.clone(),
+            completed: row.completed,
+            labels: labels,
+        })
+    }
+    accum
+}
+
+fn fold_entity(row: TodoWithLabelFromRow) -> TodoEntity {
+    let todo_entities = fold_entities(vec![row]);
+    let todo = todo_entities.first().expect("expect 1 todo");
+
+    todo.clone()
 }
 
 // TodoRepositoryを利用するHttpリクエストメソッド用の構造体
-
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Validate)]
 pub struct CreateTodo {
     #[validate(length(min = 1, message = "Can not be empty"))]
@@ -55,8 +111,8 @@ impl TodoRepositoryForDb {
 
 #[async_trait]
 impl TodoRepository for TodoRepositoryForDb {
-    async fn create(&self, payload: CreateTodo) -> anyhow::Result<Todo> {
-        let todo = sqlx::query_as::<_, Todo>(
+    async fn create(&self, payload: CreateTodo) -> anyhow::Result<TodoEntity> {
+        let todo = sqlx::query_as::<_, TodoWithLabelFromRow>(
             r#"
 INSERT INTO todos (text, completed)
 values ($1, false)
@@ -67,11 +123,11 @@ returning *
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(todo)
+        Ok(fold_entity(todo))
     }
 
-    async fn find(&self, id: i32) -> anyhow::Result<Todo> {
-        let todo = sqlx::query_as::<_, Todo>(
+    async fn find(&self, id: i32) -> anyhow::Result<TodoEntity> {
+        let todo = sqlx::query_as::<_, TodoWithLabelFromRow>(
             r#"
 SELECT * FROM todos WHERE id = $1
             "#,
@@ -84,11 +140,11 @@ SELECT * FROM todos WHERE id = $1
             _ => RepositoryError::Unexpected(e.to_string()),
         })?;
 
-        Ok(todo)
+        Ok(fold_entity(todo))
     }
 
-    async fn all(&self) -> anyhow::Result<Vec<Todo>> {
-        let todos = sqlx::query_as::<_, Todo>(
+    async fn all(&self) -> anyhow::Result<Vec<TodoEntity>> {
+        let todos = sqlx::query_as::<_, TodoWithLabelFromRow>(
             r#"
 SELECT * FROM todos
 ORDER BY id DESC;
@@ -97,12 +153,12 @@ ORDER BY id DESC;
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(todos)
+        Ok(fold_entities(todos))
     }
 
-    async fn update(&self, id: i32, payload: UpdateTodo) -> anyhow::Result<Todo> {
+    async fn update(&self, id: i32, payload: UpdateTodo) -> anyhow::Result<TodoEntity> {
         let old_todo = self.find(id).await?;
-        let todo = sqlx::query_as::<_, Todo>(
+        let todo = sqlx::query_as::<_, TodoWithLabelFromRow>(
             r#"
 UPDATE todos SET text = $1, completed = $2
 WHERE id = $3
@@ -115,7 +171,7 @@ returning *
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(todo)
+        Ok(fold_entity(todo))
     }
 
     async fn delete(&self, id: i32) -> anyhow::Result<()> {
@@ -147,12 +203,13 @@ pub mod test_utils {
 
     use super::*;
 
-    impl Todo {
+    impl TodoEntity {
         pub fn new(id: i32, text: String) -> Self {
             Self {
                 id,
                 text,
                 completed: false,
+                labels: vec![],
             }
         }
     }
@@ -163,7 +220,7 @@ pub mod test_utils {
         }
     }
 
-    type TodoDatas = HashMap<i32, Todo>;
+    type TodoDatas = HashMap<i32, TodoEntity>;
 
     // TodoRepositoryForMemoryの実装
 
@@ -192,15 +249,15 @@ pub mod test_utils {
 
     #[async_trait]
     impl TodoRepository for TodoRepositoryForMemory {
-        async fn create(&self, payload: CreateTodo) -> anyhow::Result<Todo> {
+        async fn create(&self, payload: CreateTodo) -> anyhow::Result<TodoEntity> {
             let mut store = self.write_store_ref();
             let id = (store.len() + 1) as i32;
-            let todo = Todo::new(id, payload.text.clone());
+            let todo = TodoEntity::new(id, payload.text.clone());
             store.insert(id, todo.clone());
             Ok(todo)
         }
 
-        async fn find(&self, id: i32) -> anyhow::Result<Todo> {
+        async fn find(&self, id: i32) -> anyhow::Result<TodoEntity> {
             let store = self.read_store_ref();
             let todo = store
                 .get(&id)
@@ -209,21 +266,22 @@ pub mod test_utils {
             Ok(todo)
         }
 
-        async fn all(&self) -> anyhow::Result<Vec<Todo>> {
+        async fn all(&self) -> anyhow::Result<Vec<TodoEntity>> {
             let store = self.read_store_ref();
             Ok(Vec::from_iter(store.values().map(|todo| todo.clone())))
         }
 
         // 存在しないidに対してUpdateをする可能性があるからResult型を返す
-        async fn update(&self, id: i32, payload: UpdateTodo) -> anyhow::Result<Todo> {
+        async fn update(&self, id: i32, payload: UpdateTodo) -> anyhow::Result<TodoEntity> {
             let mut store = self.write_store_ref();
             let todo = store.get(&id).context(RepositoryError::NotFound(id))?;
             let text = payload.text.unwrap_or(todo.text.clone());
             let completed = payload.completed.unwrap_or(todo.completed);
-            let todo = Todo {
+            let todo = TodoEntity {
                 id,
                 text,
                 completed,
+                labels: vec![],
             };
             store.insert(id, todo.clone()); // insertは上書きする？
             Ok(todo)
@@ -244,6 +302,59 @@ pub mod test_utils {
         use dotenv::dotenv;
         use sqlx::PgPool;
         use std::env;
+
+        #[test]
+        fn fold_entities_test() {
+            let label_1 = Label {
+                id: 1,
+                name: String::from("label 1"),
+            };
+            let label_2 = Label {
+                id: 2,
+                name: String::from("label 2"),
+            };
+            let rows = vec![
+                TodoWithLabelFromRow {
+                    id: 1,
+                    text: String::from("todo 1"),
+                    completed: false,
+                    label_id: Some(label_1.id),
+                    label_name: Some(label_1.name.clone()),
+                },
+                TodoWithLabelFromRow {
+                    id: 1,
+                    text: String::from("todo 1"),
+                    completed: false,
+                    label_id: Some(label_2.id),
+                    label_name: Some(label_2.name.clone()),
+                },
+                TodoWithLabelFromRow {
+                    id: 2,
+                    text: String::from("todo 2"),
+                    completed: false,
+                    label_id: Some(label_1.id),
+                    label_name: Some(label_1.name.clone()),
+                },
+            ];
+            let res = fold_entities(rows);
+            assert_eq!(
+                res,
+                vec![
+                    TodoEntity {
+                        id: 1,
+                        text: String::from("todo 1"),
+                        completed: false,
+                        labels: vec![label_1.clone(), label_2.clone()],
+                    },
+                    TodoEntity {
+                        id: 2,
+                        text: String::from("todo 2"),
+                        completed: false,
+                        labels: vec![label_1.clone()],
+                    },
+                ]
+            );
+        }
 
         #[tokio::test]
         async fn todo_crud_scenario() {
