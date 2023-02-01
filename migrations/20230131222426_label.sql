@@ -7,6 +7,6 @@ CREATE TABLE labels (
 -- これがないとTodo追加時のトランザクション内でまだ実在しないTodoのidを参照していることによりエラーとなってしまう
 CREATE TABLE todo_labels (
     id SERIAL PRIMARY KEY,
-    DEFERRABLE INITIALLY DEFERRED todo_id INTEGER NOT NULL REFERENCES todos (id),
+    todo_id INTEGER NOT NULL REFERENCES todos (id) DEFERRABLE INITIALLY DEFERRED,
     label_id INTEGER NOT NULL REFERENCES labels (id) DEFERRABLE INITIALLY DEFERRED
 );
